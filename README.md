@@ -157,9 +157,14 @@ curl -s -X POST http://localhost:3000/api/replan/preview \
   在**一次事务**中重新校验版本、重新做全量校验并重算落库。
 - **预演后任何会影响这些结果的正式写入**（新增/更正/删除事件、改原料过敏原、登记/删除放行等）
   **均使该版本过期**：应用返回 `409 VERSION_EXPIRED` 且**原状态不变**，需重新预演。
+  事件自增序列（`sqlite_sequence`）同样纳入版本指纹：**删除当前最大编号事件、或“新增后删除”
+  这类让现存事件清单恢复原样的写入，也会推进后续拟插入事件将分配的编号**，旧预演版本
+  一并过期，必须重新预演——否则确认应用落库的编号会与预演返回的编号错位。
 - 以下情况在预演阶段即明确拒绝（HTTP 400，`details` 给出逐条中文原因，预演失败可见原因）：
   未知事件、同一事件被重复更正、设备不存在、拟插入的清洗事件缺少时间、
   整组后时间线非法（未来引用 / 引用环 / 时间冲突 / 批次重复产出）等。
+- **版本冲突或整组校验失败不产生部分事件，也不占用正式编号**：版本/内容核对与全量校验
+  都在确认事务内、任何写入落库前完成，失败即整体回滚，事件自增序列不前进。
 
 > 既有单条事件接口（`POST/PUT/DELETE /api/events/...`）与放行接口（`/api/releases`）
 > 的语义完全保持不变；新接口只做“整组预演 + 确认应用”。
@@ -234,13 +239,73 @@ curl -s -X POST http://localhost:3000/api/replan/apply \
   "details": ["事件 #3（2026-09-30T11:30）引用了未来或同时刻批次 #4（产出时间 2026-09-30T11:00），不允许引用未来批次"] }
 ```
 
+#### 拟插入清洗事件的编号对账（本轮修复）
+
+预演在内存影子库中进行，影子库现在**与正式库对齐事件自增序列**（`sqlite_sequence`）：
+即使此前**删除过当前最大编号的清洗事件**（正式库保留序列、不复用编号），
+预演为拟插入清洗事件分配的 `event_id` 也与确认应用后正式落库的编号**逐项一致**，可按号对账。
+
+- **对账规则**：`inserted_clean_events` 中**带 `client_key` 的按该键匹配**；
+  **未带的按既有规范化顺序**（即两次响应中数组的返回顺序）逐项匹配。
+  同一有效预演版本下，预演与成功确认的 `inserted_clean_events` 每项 `event_id` 相同。
+- **序列前进即过期**：预演后若有其他操作改变了将分配的编号（如新增事件、删除事件，
+  包括“新增后删除”使现存事件清单**恢复原样**的情况），旧预演版本确认时返回
+  `409 VERSION_EXPIRED`，需重新预演后再确认。
+- **失败不占号**：版本冲突（`VERSION_EXPIRED`/`CHANGES_MISMATCH`/`VERSION_INVALID`）或
+  整组校验失败（`REPLAN_REJECTED`）时不产生任何部分事件，事件自增序列不前进，
+  下一次成功确认的事件编号紧接着现存最大编号。
+- 预演仍**不写正式库**；`preview`/`apply` 的响应字段与错误语义保持兼容。
+
+```bash
+# 0) 演示：删除当前最大编号的清洗事件（正式库序列保留高位、不复用）
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' \
+  -d '{"type":"CLEAN","event_time":"2026-10-02T08:00","equipment_id":1,"note":"临时清洗"}'
+# -> { id: 10, ... }   （假设当前最大编号为 9）
+curl -s -X DELETE http://localhost:3000/api/events/10
+
+# 1) 预演插入两条清洗（一条带 client_key，一条不带）：
+#    返回的 event_id 从已删除编号之后继续（11、12），与正式库将分配的编号一致
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changes": [
+      {"op":"insert_clean","client_key":"mid","event_time":"2026-10-02T09:00",
+       "equipment_id":1,"note":"对账清洗A（带键）"},
+      {"op":"insert_clean","event_time":"2026-10-02T10:00",
+       "equipment_id":1,"note":"对账清洗B（无键）"}
+    ]
+  }'
+# -> { ok:true, version:"<V>", inserted_clean_events:[
+#      {client_key:null, event_id:11}, {client_key:"mid", event_id:12}], ... }
+
+# 2) 确认应用（同一版本 + 同一份 changes）：inserted_clean_events 与预演逐项一致
+curl -s -X POST http://localhost:3000/api/replan/apply \
+  -H 'Content-Type: application/json' -d '{
+    "version": "<V>",
+    "changes": [ ...与预演完全相同的内容... ]
+  }'
+# -> { ok:true, phase:"APPLIED", inserted_clean_events:[
+#      {client_key:null, event_id:11}, {client_key:"mid", event_id:12}], ... }
+#    对账：client_key="mid" 的按 key 对应到事件 12；无键的按返回顺序对应到事件 11。
+
+# 3) 预演后“新增再删除”一个事件：现存事件清单恢复原样，但自增序列已前进，
+#    旧预演版本确认 -> 409 VERSION_EXPIRED，需重新预演
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' \
+  -d '{"type":"CLEAN","event_time":"2026-10-05T08:00","equipment_id":1,"note":"临时事件"}'
+curl -s -X DELETE http://localhost:3000/api/events/<上一步返回的 id>
+curl -s -X POST http://localhost:3000/api/replan/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"<旧版本>","changes":[ ...原 changes... ]}'
+# -> 409 { code:"VERSION_EXPIRED", error:"预演后正式数据已发生影响推导结果的写入，…" }
+#    拒绝后不产生部分事件、不占用正式编号；重新预演即可拿到新的对账编号。
+```
+
 | 场景 | HTTP | `code` |
 | --- | --- | --- |
 | 请求体/变更内容问题（非数组、缺时间、未知事件、重复更正、设备不存在…） | 400 | `INVALID_REQUEST` / `REPLAN_REJECTED` |
 | 整组后时间线校验失败（未来引用/环/时间冲突/批次重复产出） | 400 | `REPLAN_REJECTED` |
 | 版本签名损坏或格式非法 | 400 | `VERSION_INVALID` |
 | apply 的 changes 与预演不一致 | 409 | `CHANGES_MISMATCH` |
-| 预演后正式数据已变更导致版本过期（含重复应用同一版本、版本过期） | 409 | `VERSION_EXPIRED` |
+| 预演后正式数据已变更导致版本过期（含重复应用同一版本、版本过期，以及新增/删除事件等推进将分配编号的写入——即使现存事件清单恢复原样） | 409 | `VERSION_EXPIRED` |
 
 ## 过敏原标签卷（包装前登记 → 核销贴用/作废）
 

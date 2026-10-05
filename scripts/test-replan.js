@@ -319,6 +319,128 @@ async function main() {
     r = await api('POST', '/api/replan/apply', { changes: [] });
     check('apply 空 changes → 400', r.status === 400, r);
 
+    // ---------- 19. 删除最大编号事件后：预演与确认应用的插入编号逐项一致 ----------
+    console.log('19) 删除当前最大编号事件后，预演与确认应用的 inserted_clean_events 逐项一致');
+    // 先新增一个清洗事件再删除：正式库自增序列保留高位，现存最大 id 小于序列
+    let tmpEv = await api('POST', '/api/events', {
+      type: 'CLEAN', event_time: '2026-10-02T08:00', equipment_id: lineA, note: '临时清洗（随后删除）'
+    });
+    check('临时清洗新增成功', tmpEv.status === 200, tmpEv);
+    const deletedId = tmpEv.json.id;
+    r = await api('DELETE', `/api/events/${deletedId}`);
+    check('删除该事件成功', r.status === 200, r);
+    const st19a = (await api('GET', '/api/state')).json;
+    check('现存最大事件 id 小于已删除 id（正式库序列保留高位）',
+      Math.max(...st19a.events.map((e) => e.id)) < deletedId,
+      [Math.max(...st19a.events.map((e) => e.id)), deletedId]);
+
+    const changes19 = [
+      { op: 'insert_clean', client_key: 'mid', event_time: '2026-10-02T09:00', equipment_id: lineA, note: '对账清洗A（带键）' },
+      { op: 'insert_clean', event_time: '2026-10-02T10:00', equipment_id: lineA, note: '对账清洗B（无键）' }
+    ];
+    r = await api('POST', '/api/replan/preview', { changes: changes19 });
+    check('预演 200', r.status === 200, r);
+    const previewInserted = r.json.inserted_clean_events;
+    check('预演返回 2 条拟插入事件', previewInserted.length === 2, previewInserted);
+    check('预演编号从已删除 id 之后继续（影子库序列与正式库对齐）',
+      previewInserted.every((x) => x.event_id > deletedId), previewInserted);
+    check('预演不写正式库', !(await api('GET', '/api/state')).json.events
+      .some((e) => e.note === '对账清洗A（带键）' || e.note === '对账清洗B（无键）'));
+    const v19 = r.json.version;
+    r = await api('POST', '/api/replan/apply', { version: v19, changes: changes19 });
+    check('确认应用 200', r.status === 200, r);
+    const appliedInserted = r.json.inserted_clean_events;
+    // 对账规则：带 client_key 的按该键匹配；未带的按既有规范化顺序（返回数组顺序）逐项匹配
+    const keyed = (list) => list.filter((x) => x.client_key !== null);
+    const unkeyed = (list) => list.filter((x) => x.client_key === null);
+    check('带 client_key 的编号一致',
+      keyed(previewInserted).length === keyed(appliedInserted).length &&
+      keyed(previewInserted).every((x) =>
+        appliedInserted.some((y) => y.client_key === x.client_key && y.event_id === x.event_id)),
+      [previewInserted, appliedInserted]);
+    check('未带 client_key 的按顺序逐项一致',
+      unkeyed(previewInserted).length === unkeyed(appliedInserted).length &&
+      unkeyed(previewInserted).every((x, i) => x.event_id === unkeyed(appliedInserted)[i].event_id),
+      [previewInserted, appliedInserted]);
+    const st19b = (await api('GET', '/api/state')).json;
+    check('两条清洗事件按回执编号真实落库',
+      appliedInserted.every((x) => st19b.events.some((e) => e.id === x.event_id && e.type === 'CLEAN')),
+      appliedInserted);
+
+    // ---------- 20. 预演后“新增再删除”推进序列：旧版本必须过期 ----------
+    console.log('20) 预演后其他操作推进将分配的编号（即使清单恢复原样）→ 旧版本拒绝确认');
+    const changes20 = [
+      { op: 'insert_clean', client_key: 'seq', event_time: '2026-10-03T09:00', equipment_id: lineA, note: '序列对账清洗' }
+    ];
+    r = await api('POST', '/api/replan/preview', { changes: changes20 });
+    check('预演 200', r.status === 200, r);
+    const v20 = r.json.version;
+    const stBefore20 = (await api('GET', '/api/state')).json;
+    // 新增再删除一个事件：现存事件清单恢复原样，但自增序列已前进
+    tmpEv = await api('POST', '/api/events', {
+      type: 'CLEAN', event_time: '2026-10-05T08:00', equipment_id: lineA, note: '临时事件（推进序列）'
+    });
+    check('临时事件新增成功', tmpEv.status === 200, tmpEv);
+    r = await api('DELETE', `/api/events/${tmpEv.json.id}`);
+    check('临时事件删除成功', r.status === 200, r);
+    const stAfter20 = (await api('GET', '/api/state')).json;
+    check('事件清单恢复原样（条数与 id 集合一致）',
+      stAfter20.events.length === stBefore20.events.length &&
+      stAfter20.events.every((e) => stBefore20.events.some((x) => x.id === e.id)));
+    r = await api('POST', '/api/replan/apply', { version: v20, changes: changes20 });
+    check('旧版本确认 → 409 VERSION_EXPIRED', r.status === 409 && r.json.code === 'VERSION_EXPIRED', r);
+    check('拒绝后正式库未插入该清洗',
+      !(await api('GET', '/api/state')).json.events.some((e) => e.note === '序列对账清洗'));
+    // 重新预演后确认应用成功，且编号与新预演一致
+    r = await api('POST', '/api/replan/preview', { changes: changes20 });
+    check('重新预演 200', r.status === 200, r);
+    const preview20b = r.json.inserted_clean_events;
+    r = await api('POST', '/api/replan/apply', { version: r.json.version, changes: changes20 });
+    check('重新预演后确认应用 200', r.status === 200, r);
+    check('新预演与确认编号一致',
+      r.json.inserted_clean_events.length === preview20b.length &&
+      r.json.inserted_clean_events[0].event_id === preview20b[0].event_id,
+      [preview20b, r.json.inserted_clean_events]);
+
+    // ---------- 21. 版本冲突与整组校验失败不产生部分事件、不占用正式编号 ----------
+    console.log('21) 版本冲突/整组校验失败不产生部分事件，也不占用正式编号');
+    const stBefore21 = (await api('GET', '/api/state')).json;
+    const maxIdBefore21 = Math.max(...stBefore21.events.map((e) => e.id));
+    // a) 整组校验失败：插入清洗与 BATCH-002（10:00，LINE-A）同设备同时刻冲突
+    r = await api('POST', '/api/replan/preview', {
+      changes: [{ op: 'insert_clean', event_time: D + '10:00', equipment_id: lineA, note: '冲突清洗' }]
+    });
+    check('整组校验失败预演 400 REPLAN_REJECTED',
+      r.status === 400 && r.json.code === 'REPLAN_REJECTED', r.json);
+    // b) 版本冲突：用过期版本确认
+    r = await api('POST', '/api/replan/apply', { version: v20, changes: changes20 });
+    check('过期版本确认 409 VERSION_EXPIRED', r.status === 409 && r.json.code === 'VERSION_EXPIRED', r);
+    // c) 内容不一致：预演 09:00、确认 10:00
+    r = await api('POST', '/api/replan/preview', {
+      changes: [{ op: 'insert_clean', client_key: 'nx', event_time: '2026-10-06T09:00', equipment_id: lineA, note: '下一条清洗' }]
+    });
+    check('预演 200', r.status === 200, r);
+    const v21 = r.json.version;
+    r = await api('POST', '/api/replan/apply', {
+      version: v21,
+      changes: [{ op: 'insert_clean', client_key: 'nx', event_time: '2026-10-06T10:00', equipment_id: lineA, note: '下一条清洗' }]
+    });
+    check('内容不一致确认 409 CHANGES_MISMATCH', r.status === 409 && r.json.code === 'CHANGES_MISMATCH', r);
+    // 上述失败均未产生事件、未占用编号
+    const stMid21 = (await api('GET', '/api/state')).json;
+    check('失败后正式事件数不变', stMid21.events.length === stBefore21.events.length,
+      [stMid21.events.length, stBefore21.events.length]);
+    check('失败后现存最大事件 id 不变',
+      Math.max(...stMid21.events.map((e) => e.id)) === maxIdBefore21);
+    // 用与预演一致的 changes 确认：成功且编号紧接着现存最大 id（失败未占用编号）
+    r = await api('POST', '/api/replan/apply', {
+      version: v21,
+      changes: [{ op: 'insert_clean', client_key: 'nx', event_time: '2026-10-06T09:00', equipment_id: lineA, note: '下一条清洗' }]
+    });
+    check('与预演一致的确认 200', r.status === 200, r);
+    check('新事件编号紧接着现存最大 id（失败未占用正式编号）',
+      r.json.inserted_clean_events[0].event_id === maxIdBefore21 + 1, r.json.inserted_clean_events);
+
   } finally {
     proc.kill('SIGTERM');
     await sleep(300);

@@ -391,7 +391,11 @@ const FINGERPRINT_SQL = [
   // 批号期初结存 / 入库流水与输入克数：影响“按最终事件集核对累计领用”，纳入指纹。
   'SELECT id, lot_id, quantity_grams, registered_by, registered_at, note FROM lot_opening_balances ORDER BY id',
   'SELECT id, receipt_code, lot_id, quantity_grams, received_by, received_at, note FROM lot_inbound_receipts ORDER BY id',
-  'SELECT id, event_id, material_id, batch_id, material_lot_id, qty_grams FROM process_inputs ORDER BY id'
+  'SELECT id, event_id, material_id, batch_id, material_lot_id, qty_grams FROM process_inputs ORDER BY id',
+  // 自增序列（sqlite_sequence）纳入指纹：删除当前最大编号事件、或“新增后删除”这类
+  // 让现存事件清单恢复原样的写入，仍会推进后续拟插入清洗事件将分配的编号；
+  // 旧预演版本必须据此过期并要求重新预演，否则确认应用落库的编号与预演返回不一致。
+  'SELECT name, seq FROM sqlite_sequence ORDER BY name'
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -772,6 +776,19 @@ function openShadow(sourceDb) {
   // 批号库存台账（期初/入库流水只增不改）：影子库据此核对累计领用并计算余额差异。
   copy('lot_opening_balances', 'id,lot_id,quantity_grams,registered_by,registered_at,note,created_at');
   copy('lot_inbound_receipts', 'id,receipt_code,lot_id,quantity_grams,received_by,received_at,note,created_at');
+  // 自增序列对齐：正式库删除过当前最大编号的事件后，sqlite_sequence 仍保留高位序列，
+  // 而按剩余行拷贝的影子库序列只到现存最大 id；若不同步，影子库为拟插入清洗事件
+  // 分配的编号会小于确认应用时正式库实际分配的编号，预演与落库编号对不上、无法按号对账。
+  // 逐表对齐后影子库分配的 id 与正式库完全一致（序列本身亦已纳入预演版本指纹，
+  // 预演后任何推进序列的正式写入都会使旧版本过期，见 FINGERPRINT_SQL）。
+  const seqRows = sourceDb.prepare('SELECT name, seq FROM sqlite_sequence').all();
+  if (seqRows.length) {
+    const updSeq = shadow.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?');
+    const insSeq = shadow.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)');
+    for (const r of seqRows) {
+      if (updSeq.run(r.seq, r.name).changes === 0) insSeq.run(r.name, r.seq);
+    }
+  }
   shadow.pragma('foreign_keys = ON');
   return shadow;
 }
