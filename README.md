@@ -155,6 +155,8 @@ curl -s -X POST http://localhost:3000/api/replan/preview \
 - 预演返回业务版本 `version`（签名令牌，30 分钟有效；服务重启后旧版本作废）。
 - `POST /api/replan/apply` 确认应用：**必须携带预演版本及与预演完全相同的 changes**，
   在**一次事务**中重新校验版本、重新做全量校验并重算落库。
+- 预演返回的拟插入清洗事件编号（`inserted_clean_events`）与确认应用实际分配的编号
+  **逐项一致**（影子库沿用正式库自增序列；详见下文「换线预演编号一致性与对账」）。
 - **预演后任何会影响这些结果的正式写入**（新增/更正/删除事件、改原料过敏原、登记/删除放行等）
   **均使该版本过期**：应用返回 `409 VERSION_EXPIRED` 且**原状态不变**，需重新预演。
 - 以下情况在预演阶段即明确拒绝（HTTP 400，`details` 给出逐条中文原因，预演失败可见原因）：
@@ -240,7 +242,75 @@ curl -s -X POST http://localhost:3000/api/replan/apply \
 | 整组后时间线校验失败（未来引用/环/时间冲突/批次重复产出） | 400 | `REPLAN_REJECTED` |
 | 版本签名损坏或格式非法 | 400 | `VERSION_INVALID` |
 | apply 的 changes 与预演不一致 | 409 | `CHANGES_MISMATCH` |
-| 预演后正式数据已变更导致版本过期（含重复应用同一版本、版本过期） | 409 | `VERSION_EXPIRED` |
+| 预演后正式数据已变更导致版本过期（含重复应用同一版本；含新增/删除事件等改变“将分配编号”的写入，即使现存事件清单随后恢复原样） | 409 | `VERSION_EXPIRED` |
+
+## 换线预演编号一致性与对账（本轮修复）
+
+换线预演返回拟插入清洗事件的 `event_id`（`inserted_clean_events`）。此前若**删除了当前最大编号的
+清洗事件**，正式库保留自增序列（下一编号不回退），预演影子库却按剩余事件重建序列，
+导致预演编号与确认应用编号不同、无法按号对账。本轮修复后：
+
+- **影子库沿用正式库自增序列**：预演在内存影子库中按正式库同一事件序列分配编号；
+  **同一有效预演版本中，预演与成功确认的 `inserted_clean_events` 逐项 `event_id` 一致**——
+  带 `client_key` 的按该键匹配，未带的按既有规范化顺序匹配。
+- **事件自增序列纳入版本指纹**：预演后任何改变“将分配编号”的正式写入
+  （新增/删除事件，**哪怕现存事件清单随后恢复原样**）都会使旧预演版本过期，
+  确认应用返回 `409 VERSION_EXPIRED` 且不产生任何事件，需重新预演后再确认。
+- **预演仍不写正式库**；原有响应字段及错误语义保持兼容（无新增错误码）。
+- **版本冲突或整组校验失败不产生部分事件，也不占用正式编号**：
+  `CHANGES_MISMATCH` / `VERSION_INVALID` / `VERSION_EXPIRED` 在任何写入之前拒绝；
+  整组校验失败在同一事务内回滚（含自增序列），下一次成功写入的事件编号保持连续、无跳号。
+
+#### 调用示例（curl，基于演示数据）
+
+```bash
+# 1) 制造“最大编号清洗事件被删除”的场景：新增再删除（正式库序列不回退；
+#    演示库原有事件编号 1..9，新事件为 #10）
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' \
+  -d '{"type":"CLEAN","event_time":"2026-10-02T08:00","equipment_id":1,"note":"临时清洗"}'
+# -> { "id": 10, ... }
+curl -s -X DELETE http://localhost:3000/api/events/10
+
+# 2) 预演：拟插入两条清洗（一条带 client_key，一条不带）
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changes": [
+      {"op":"insert_clean","client_key":"mid-wash","event_time":"2026-10-02T09:00",
+       "equipment_id":1,"note":"换线中间清洗"},
+      {"op":"insert_clean","event_time":"2026-10-02T10:00",
+       "equipment_id":1,"note":"无键清洗"}
+    ]
+  }'
+# -> { ok:true, phase:"PREVIEW", version:"<业务版本令牌>", ...,
+#      inserted_clean_events:[ {client_key:null,       event_id:11},
+#                              {client_key:"mid-wash", event_id:12} ] }
+#    编号接续正式库保留的序列（被删 #10 之后），预演本身不写正式库。
+
+# 3) 确认应用：逐项 event_id 与预演一致（带键按键、无键按规范化顺序对账）
+curl -s -X POST http://localhost:3000/api/replan/apply \
+  -H 'Content-Type: application/json' -d '{
+    "version": "<上一步返回的 version>",
+    "changes": [ ...与预演完全相同的内容... ]
+  }'
+# -> { ok:true, phase:"APPLIED",
+#      inserted_clean_events:[ {client_key:null,       event_id:11},
+#                              {client_key:"mid-wash", event_id:12} ], ... }
+
+# 4) 预演后“新增再删除”一个事件：现存事件清单虽恢复原样，
+#    但将分配的编号已变，旧版本确认被拒绝、须重新预演
+curl -s -X POST http://localhost:3000/api/replan/preview ...   # 得版本 V（预测下一编号 13）
+curl -s -X POST http://localhost:3000/api/events ...           # 新增事件 #13
+curl -s -X DELETE http://localhost:3000/api/events/13          # 再删除，事件清单复原
+curl -s -X POST http://localhost:3000/api/replan/apply ...     # 携带版本 V 与相同 changes
+# -> 409 { code:"VERSION_EXPIRED" }，不产生任何事件；
+#    重新预演后编号推进为 14，确认应用与重新预演逐项一致。
+
+# 5) 版本冲突/整组校验失败不占号：CHANGES_MISMATCH、VERSION_INVALID、
+#    VERSION_EXPIRED 与整组校验失败（REPLAN_REJECTED）均不产生部分事件，
+#    下一次成功写入的事件编号保持连续（无跳号）。
+```
+
+端到端测试：`npm run test:replan-event-ids`。
 
 ## 过敏原标签卷（包装前登记 → 核销贴用/作废）
 

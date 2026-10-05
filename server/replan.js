@@ -11,6 +11,13 @@
 // 版本（业务版本）采用无状态签名令牌：载荷为「正式状态指纹 + 变更内容哈希 + 时间戳」，
 // 用进程密钥做 HMAC。预演后任何会改变推导输入/结果的正式写入
 // （事件、原料过敏原、放行等）都会改变指纹，应用时指纹对不上即拒绝且原状态不变。
+//
+// 拟插入清洗事件的编号一致性：影子库完整沿用正式库的事件自增序列（sqlite_sequence），
+// 且事件序列本身纳入状态指纹——因此同一有效预演版本下，预演返回的
+// inserted_clean_events 与确认应用实际分配的 event_id 逐项一致
+// （带 client_key 的按该键对应，未带的按规范化顺序对应）；预演后任何改变
+// “将分配编号”的正式写入（新增/删除事件，哪怕事件清单随后恢复原样）
+// 都会使旧版本过期（409 VERSION_EXPIRED），须重新预演。
 
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
@@ -391,7 +398,12 @@ const FINGERPRINT_SQL = [
   // 批号期初结存 / 入库流水与输入克数：影响“按最终事件集核对累计领用”，纳入指纹。
   'SELECT id, lot_id, quantity_grams, registered_by, registered_at, note FROM lot_opening_balances ORDER BY id',
   'SELECT id, receipt_code, lot_id, quantity_grams, received_by, received_at, note FROM lot_inbound_receipts ORDER BY id',
-  'SELECT id, event_id, material_id, batch_id, material_lot_id, qty_grams FROM process_inputs ORDER BY id'
+  'SELECT id, event_id, material_id, batch_id, material_lot_id, qty_grams FROM process_inputs ORDER BY id',
+  // 事件表自增序列（sqlite_sequence）：正式库删除最大编号事件后序列不回退。
+  // 预演后任何改变“将分配事件编号”的写入（新增/删除事件，哪怕现存事件清单随后
+  // 恢复原样）都会使序列变化、旧预演版本过期——否则预演拟插入清洗事件的编号
+  // 与确认应用实际分配的编号不一致，无法按号对账。
+  "SELECT name, seq FROM sqlite_sequence WHERE name = 'events'"
 ];
 function stateFingerprint(db) {
   const h = crypto.createHash('sha256');
@@ -772,8 +784,21 @@ function openShadow(sourceDb) {
   // 批号库存台账（期初/入库流水只增不改）：影子库据此核对累计领用并计算余额差异。
   copy('lot_opening_balances', 'id,lot_id,quantity_grams,registered_by,registered_at,note,created_at');
   copy('lot_inbound_receipts', 'id,receipt_code,lot_id,quantity_grams,received_by,received_at,note,created_at');
+  // 自增序列（sqlite_sequence）与正式库保持一致：正式库删除过最大编号事件后序列不回退，
+  // 影子库若按剩余事件重建序列，预演拟插入清洗事件的编号就会与确认应用实际分配的编号
+  // 不一致。整表对齐后，同一有效预演版本下两者的 inserted_clean_events 逐项相同。
+  syncSequence(sourceDb, shadow);
   shadow.pragma('foreign_keys = ON');
   return shadow;
+}
+
+// 把正式库 sqlite_sequence 整表覆盖到影子库（影子库中因拷贝而重建的序列一律以正式库为准；
+// 正式库有序列记录但影子库尚无对应行的表——如事件曾全部删除——补插该行）。
+function syncSequence(sourceDb, shadow) {
+  shadow.prepare('DELETE FROM sqlite_sequence').run();
+  const rows = sourceDb.prepare('SELECT name, seq FROM sqlite_sequence').all();
+  const ins = shadow.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)');
+  for (const r of rows) ins.run(r.name, r.seq);
 }
 
 // 在影子库上完整预演；成功返回 { resolved, inserted, snapshotAfter, diff }。
